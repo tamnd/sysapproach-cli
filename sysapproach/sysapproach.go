@@ -1,10 +1,4 @@
-// Package sysapproach is the library behind the sysapproach command line:
-// the HTTP client, request shaping, and the typed data models for sysapproach.
-//
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// Package sysapproach is the library behind the sysapproach CLI.
 package sysapproach
 
 import (
@@ -13,50 +7,108 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to sysapproach. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "sysapproach/dev (+https://github.com/tamnd/sysapproach-cli)"
+// DefaultUserAgent identifies the client to the server. An honest User-Agent
+// is both polite and the thing most likely to keep a session unblocked.
+const DefaultUserAgent = "sysapproach-cli/dev (+https://github.com/tamnd/sysapproach-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at sysapproach.com; change it once you
-// know the real endpoints you want to read.
-const Host = "sysapproach.com"
+// Host is the canonical hostname of the book site.
+const Host = "book.systemsapproach.org"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
-
-// Client talks to sysapproach over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds per-client tunables, all of which have sane defaults.
+type Config struct {
+	BaseURL   string
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// DefaultConfig returns a Config with polite, safe defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://" + Host,
+		Rate:      500 * time.Millisecond,
+		Timeout:   30 * time.Second,
+		Retries:   3,
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to book.systemsapproach.org over HTTPS.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	last time.Time
+}
+
+// NewClient returns a Client using cfg.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+var chapRe = regexp.MustCompile(`href="([\w-]+\.html)"[^>]*>\s*(Chapter (\d+):\s+[^<]+)</a>`)
+
+// Chapters fetches the home page and returns the book's chapters sorted by
+// chapter number. Duplicate links (Sphinx repeats chapter links in the sidebar
+// and in the main table of contents) are deduplicated by chapter number.
+func (c *Client) Chapters(ctx context.Context) ([]*Chapter, error) {
+	body, err := c.get(ctx, c.cfg.BaseURL+"/")
+	if err != nil {
+		return nil, err
+	}
+	html := string(body)
+
+	seen := map[int]bool{}
+	var chapters []*Chapter
+
+	for _, m := range chapRe.FindAllStringSubmatch(html, -1) {
+		href := m[1]
+		full := m[2] // e.g. "Chapter 1:  Foundation"
+		numStr := m[3]
+
+		number, err := strconv.Atoi(numStr)
+		if err != nil {
+			continue
+		}
+		if seen[number] {
+			continue
+		}
+		seen[number] = true
+
+		prefix := "Chapter " + numStr + ":"
+		title := strings.TrimSpace(strings.TrimPrefix(full, prefix))
+		url := c.cfg.BaseURL + "/" + href
+
+		chapters = append(chapters, &Chapter{
+			Number: number,
+			Title:  title,
+			URL:    url,
+		})
+	}
+
+	sort.Slice(chapters, func(i, j int) bool {
+		return chapters[i].Number < chapters[j].Number
+	})
+	for i, ch := range chapters {
+		ch.Rank = i + 1
+	}
+
+	return chapters, nil
+}
+
+// get fetches url with retries and exponential backoff on transient errors.
+func (c *Client) get(ctx context.Context, url string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -76,15 +128,15 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 	return nil, fmt.Errorf("get %s: %w", url, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, url string) ([]byte, bool, error) {
 	c.pace()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -96,7 +148,6 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	if resp.StatusCode != http.StatusOK {
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
-
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, true, err
@@ -104,97 +155,17 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
+// pace blocks until at least cfg.Rate has elapsed since the last request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
 }
 
 func backoff(attempt int) time.Duration {
-	d := time.Duration(attempt) * 500 * time.Millisecond
-	if d > 5*time.Second {
-		d = 5 * time.Second
-	}
-	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on sysapproach.com. It is a stand-in for the typed records you
-// will model from the real sysapproach endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `sysapproach cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
+	return min(time.Duration(attempt)*500*time.Millisecond, 5*time.Second)
 }

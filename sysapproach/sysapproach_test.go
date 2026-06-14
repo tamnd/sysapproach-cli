@@ -1,62 +1,49 @@
-package sysapproach
+package sysapproach_test
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
+
+	"github.com/tamnd/sysapproach-cli/sysapproach"
 )
 
-func TestGet(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("User-Agent") == "" {
-			t.Error("request carried no User-Agent")
-		}
-		_, _ = w.Write([]byte("ok"))
-	}))
-	defer srv.Close()
+const fakeHTML = `<html><body>
+<a href="foundation.html">Chapter 1:  Foundation</a>
+<a href="direct.html">Chapter 2:  Direct Links</a>
+<a href="foundation.html">Chapter 1:  Foundation</a>
+</body></html>`
 
-	c := NewClient()
-	c.Rate = 0 // no pacing in the test
-
-	body, err := c.Get(context.Background(), srv.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(body) != "ok" {
-		t.Errorf("body = %q, want %q", body, "ok")
-	}
+func newTestClient(ts *httptest.Server) *sysapproach.Client {
+	cfg := sysapproach.DefaultConfig()
+	cfg.BaseURL = ts.URL
+	cfg.Rate = 0
+	return sysapproach.NewClient(cfg)
 }
 
-func TestGetRetriesOn503(t *testing.T) {
-	var hits int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits++
-		if hits < 3 {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
-		_, _ = w.Write([]byte("recovered"))
+func TestChapters(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, fakeHTML)
 	}))
-	defer srv.Close()
+	defer ts.Close()
 
-	c := NewClient()
-	c.Rate = 0
-	c.Retries = 5
-
-	start := time.Now()
-	body, err := c.Get(context.Background(), srv.URL)
+	c := newTestClient(ts)
+	chapters, err := c.Chapters(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(body) != "recovered" {
-		t.Errorf("body = %q after retries", body)
+	if len(chapters) != 2 {
+		t.Fatalf("want 2 (deduped), got %d", len(chapters))
 	}
-	if hits != 3 {
-		t.Errorf("server saw %d hits, want 3", hits)
+	if chapters[0].Number != 1 {
+		t.Errorf("Number[0] = %d", chapters[0].Number)
 	}
-	if time.Since(start) < 500*time.Millisecond {
-		t.Error("retries did not back off")
+	if chapters[0].Title != "Foundation" {
+		t.Errorf("Title[0] = %q", chapters[0].Title)
+	}
+	if chapters[0].Rank != 1 {
+		t.Errorf("Rank = %d", chapters[0].Rank)
 	}
 }

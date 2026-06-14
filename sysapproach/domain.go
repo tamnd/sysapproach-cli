@@ -3,7 +3,9 @@ package sysapproach
 import (
 	"context"
 	"net/url"
+	"regexp"
 	"strings"
+	"time"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
@@ -19,9 +21,6 @@ import (
 // sysapproach:// URIs by routing to the operations Register installs. The same
 // Domain also builds the standalone sysapproach binary (see cli.NewApp), so the
 // binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
 // Domain is the sysapproach driver. It carries no state; the per-run client is
@@ -36,63 +35,61 @@ func (Domain) Info() kit.DomainInfo {
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "sysapproach",
-			Short:  "A command line for sysapproach.",
-			Long: `A command line for sysapproach.
+			Short:  "Browse Computer Networks: A Systems Approach from the command line.",
+			Long: `Browse Computer Networks: A Systems Approach from the command line.
 
-sysapproach reads public sysapproach data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+sysapproach reads public data from book.systemsapproach.org over HTTPS, shapes
+it into clean records, and prints output that pipes into the rest of your tools.
+No API key, nothing to run alongside it.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/sysapproach-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `sysapproach page` and
-	// `ant get sysapproach://page/<id>`.
+	// chapters: list all book chapters.
+	kit.Handle(app, kit.OpMeta{Name: "chapters", Group: "read", List: true,
+		Summary: "List all chapters of Computer Networks: A Systems Approach"},
+		listChapters)
+
+	// page: resolver op — fetch one page by path or URL.
 	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
 		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
 		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
 
-	// List op: members of a page, the home of `sysapproach links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// sysapproach://page/ URI a host can follow.
+	// links: list the pages a page links to.
 	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
 		Summary: "List the pages a page links to", URIType: "page",
 		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	dcfg := DefaultConfig()
 	if cfg.UserAgent != "" {
-		c.UserAgent = cfg.UserAgent
+		dcfg.UserAgent = cfg.UserAgent
 	}
 	if cfg.Rate > 0 {
-		c.Rate = cfg.Rate
+		dcfg.Rate = cfg.Rate
 	}
 	if cfg.Retries > 0 {
-		c.Retries = cfg.Retries
+		dcfg.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		dcfg.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(dcfg), nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
+// --- input types ---
+
+type chaptersIn struct {
+	Client *Client `kit:"inject"`
+}
 
 type pageRef struct {
 	Ref    string  `kit:"arg" help:"page path or URL"`
@@ -107,31 +104,65 @@ type listRef struct {
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func listChapters(ctx context.Context, in chaptersIn, emit func(*Chapter) error) error {
+	chapters, err := in.Client.Chapters(ctx)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for _, ch := range chapters {
+		if err := emit(ch); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
+// Page is a generic page record used by the page/links ops.
+type Page struct {
+	ID    string `json:"id" kit:"id"`
+	URL   string `json:"url"`
+	Title string `json:"title,omitempty"`
+	Body  string `json:"body,omitempty" kit:"body"`
+}
 
-// Classify turns any accepted input — a bare path or a full sysapproach.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
+	path := pagePath(in.Ref)
+	url := DefaultConfig().BaseURL + "/" + path
+	body, err := in.Client.get(ctx, url)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(&Page{ID: path, URL: url, Title: path, Body: pageText(body)})
+}
+
+func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
+	baseURL := DefaultConfig().BaseURL
+	path := pagePath(in.Ref)
+	body, err := in.Client.get(ctx, baseURL+"/"+path)
+	if err != nil {
+		return mapErr(err)
+	}
+	seen := map[string]bool{}
+	count := 0
+	for _, p := range linkPaths(body) {
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		if err := emit(&Page{ID: p, URL: baseURL + "/" + p}); err != nil {
+			return err
+		}
+		count++
+		if in.Limit > 0 && count >= in.Limit {
+			break
+		}
+	}
+	return nil
+}
+
+// --- Resolver: URI string functions, pure and network-free ---
+
+// Classify turns any accepted input into the canonical (type, id).
 func (Domain) Classify(input string) (uriType, id string, err error) {
 	id = pagePath(input)
 	if id == "" {
@@ -145,13 +176,11 @@ func (Domain) Locate(uriType, id string) (string, error) {
 	if uriType != "page" {
 		return "", errs.Usage("sysapproach has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
+	return DefaultConfig().BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
 // --- helpers ---
 
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
 func pagePath(input string) string {
 	input = strings.TrimSpace(input)
 	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
@@ -160,14 +189,31 @@ func pagePath(input string) string {
 	return strings.Trim(input, "/")
 }
 
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+var hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
+
+func linkPaths(body []byte) []string {
+	var out []string
+	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
+		if p := strings.Trim(string(m[1]), "/"); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+var tagRE = regexp.MustCompile(`<[^>]+>`)
+
+func pageText(body []byte) string {
+	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
+	if len(s) > 500 {
+		s = s[:500]
+	}
+	return s
+}
+
 func mapErr(err error) error {
 	return err
 }
+
+// satisfy compile: time is used by newClient's cfg.Timeout check via kit.Config
+var _ = time.Second

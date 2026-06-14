@@ -1,14 +1,8 @@
 # sysapproach
 
-A command line for sysapproach.
+Browse [Computer Networks: A Systems Approach](https://book.systemsapproach.org/) from the command line.
 
-`sysapproach` is a single pure-Go binary. It reads public sysapproach data
-over plain HTTPS, shapes it into clean records, and prints output that pipes
-into the rest of your tools. No API key, nothing to run alongside it.
-
-The same package is also a [resource-URI driver](#use-it-as-a-resource-uri-driver),
-so a host program like [ant](https://github.com/tamnd/ant) can address
-sysapproach as `sysapproach://` URIs.
+`sysapproach` is a single pure-Go binary. No API key required.
 
 ## Install
 
@@ -16,8 +10,7 @@ sysapproach as `sysapproach://` URIs.
 go install github.com/tamnd/sysapproach-cli/cmd/sysapproach@latest
 ```
 
-Or grab a prebuilt binary from the [releases](https://github.com/tamnd/sysapproach-cli/releases), or run
-the container image:
+Or grab a prebuilt binary from the [releases](https://github.com/tamnd/sysapproach-cli/releases), or run the container image:
 
 ```bash
 docker run --rm ghcr.io/tamnd/sysapproach:latest --help
@@ -26,59 +19,55 @@ docker run --rm ghcr.io/tamnd/sysapproach:latest --help
 ## Usage
 
 ```bash
-sysapproach page <path>                      # fetch one page as a record
-sysapproach page <path> -o json              # as JSON, ready for jq
-sysapproach page <path> --template '{{.Body}}'  # just the readable body text
-sysapproach links <path>                     # the pages it links to, one per line
-sysapproach --help                           # the whole command tree
+# List all chapters
+sysapproach chapters
+
+# Table output
+sysapproach chapters -o table
+
+# JSON output, ready for jq
+sysapproach chapters -o json
+
+# Get chapter URLs only
+sysapproach chapters -o url
 ```
 
-Every command shares one output contract: `-o table|json|jsonl|csv|tsv|url|raw`,
-`--fields` to pick columns, `--template` for a custom line, and `-n` to limit.
-The default adapts to where output goes (a table on a terminal, JSONL in a
-pipe), so the same command reads well by hand and parses cleanly downstream.
+## Commands
 
-This is a fresh scaffold. It ships one example resource type, `page`, wired end
-to end. Model the real sysapproach records in `sysapproach/` and declare their
-operations in `sysapproach/domain.go`; each one becomes a command, an HTTP
-route, and an MCP tool at once.
+| Command | Description |
+|---------|-------------|
+| `chapters` | List all chapters of Computer Networks: A Systems Approach |
+| `version` | Show version information |
+
+## Global flags
+
+```
+-o, --output string    output format: table|json|jsonl|csv|tsv|url|raw (default "auto")
+-n, --limit int        limit number of records (0 = all)
+    --fields strings   comma-separated columns to include
+    --no-header        omit header row
+    --template string  Go text/template per record
+    --timeout duration per-request timeout (default 30s)
+    --delay duration   minimum spacing between requests
+    --retries int      retry attempts on 429/5xx (default 3)
+```
 
 ## Serve it
 
-The same operations are available over HTTP and as an MCP tool set for agents,
-with no extra code:
+The same operations are available over HTTP and as an MCP tool set for agents:
 
 ```bash
-sysapproach serve --addr :7777    # GET /v1/page/<path>  returns NDJSON
+sysapproach serve --addr :7777    # GET /v1/chapters returns NDJSON
 sysapproach mcp                   # speak MCP over stdio
-```
-
-## Use it as a resource-URI driver
-
-`sysapproach` registers a `sysapproach` domain the way a program registers a
-database driver with `database/sql`. A host enables it with one blank import:
-
-```go
-import _ "github.com/tamnd/sysapproach-cli/sysapproach"
-```
-
-Then [ant](https://github.com/tamnd/ant) (or any program that links the package)
-dereferences `sysapproach://` URIs without knowing anything about sysapproach:
-
-```bash
-ant get sysapproach://page/<path>   # fetch the record
-ant cat sysapproach://page/<path>   # just the body text
-ant ls  sysapproach://page/<path>   # the pages it links to, each addressable
-ant url sysapproach://page/<path>   # the live https URL
 ```
 
 ## Development
 
 ```
-cmd/sysapproach/   thin main: hands cli.NewApp to kit.Run
-cli/                 assembles the kit App from the sysapproach domain
-sysapproach/                the library: HTTP client, data models, and domain.go (the driver)
-docs/                tago documentation site
+cmd/sysapproach/   thin main
+cli/               assembles the kit App from the sysapproach domain
+sysapproach/       HTTP client, data models, domain driver
+docs/              documentation site
 ```
 
 ```bash
@@ -86,20 +75,6 @@ make build      # ./bin/sysapproach
 make test       # go test ./...
 make vet        # go vet ./...
 ```
-
-## Releasing
-
-Push a version tag and GitHub Actions runs GoReleaser, which builds the
-archives, Linux packages, the multi-arch GHCR image, checksums, SBOMs, and a
-cosign signature:
-
-```bash
-git tag v0.1.0
-git push --tags
-```
-
-The Homebrew and Scoop steps self-disable until their tokens exist, so the first
-release works with no extra secrets.
 
 ## License
 
